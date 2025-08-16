@@ -10,15 +10,22 @@
 (define-constant err-group-full (err u108))
 (define-constant err-not-enrolled (err u109))
 (define-constant err-invalid-rating (err u110))
+(define-constant err-not-completed (err u111))
+(define-constant err-already-certified (err u112))
+(define-constant err-invalid-grade (err u113))
+(define-constant err-certificate-not-found (err u114))
+(define-constant err-certificate-revoked (err u115))
 
 (define-non-fungible-token skillhub-course uint)
 (define-non-fungible-token skillhub-enrollment uint)
+(define-non-fungible-token skillhub-certificate uint)
 
 (define-data-var next-course-id uint u1)
 (define-data-var next-enrollment-id uint u1)
 (define-data-var next-group-id uint u1)
 (define-data-var next-discussion-id uint u1)
 (define-data-var next-resource-id uint u1)
+(define-data-var next-certificate-id uint u1)
 
 (define-map courses
     uint 
@@ -95,6 +102,50 @@
     {
         rating: uint,
         voted-at: uint
+    }
+)
+
+(define-map certificates
+    uint
+    {
+        student: principal,
+        course-id: uint,
+        instructor: principal,
+        grade: uint,
+        completion-date: uint,
+        certificate-hash: (string-ascii 64),
+        certificate-level: (string-ascii 20),
+        active: bool,
+        verification-code: (string-ascii 32)
+    }
+)
+
+(define-map course-completions
+    {student: principal, course-id: uint}
+    {
+        completed: bool,
+        completion-date: uint,
+        final-grade: uint,
+        attempts: uint
+    }
+)
+
+(define-map certificate-templates
+    uint
+    {
+        course-id: uint,
+        template-name: (string-ascii 50),
+        min-grade-required: uint,
+        certificate-level: (string-ascii 20),
+        active: bool
+    }
+)
+
+(define-map certificate-verifications
+    {certificate-id: uint, verifier: principal}
+    {
+        verified-at: uint,
+        verification-status: bool
     }
 )
 
@@ -350,3 +401,152 @@
 (define-read-only (get-resource-vote (resource-id uint) (voter principal))
     (ok (map-get? resource-votes {resource-id: resource-id, voter: voter}))
 )
+
+(define-private (generate-verification-code (student principal) (course-id uint))
+    (unwrap-panic (as-max-len? (concat "CERT" (int-to-ascii course-id)) u32))
+)
+
+
+
+(define-public (mark-course-completion (student principal) (course-id uint) (final-grade uint))
+    (let ((course (unwrap! (map-get? courses course-id) err-not-found)))
+        (asserts! (is-eq tx-sender (get creator course)) err-not-authorized)
+        (asserts! (and (>= final-grade u0) (<= final-grade u100)) err-invalid-grade)
+        (let ((existing-completion (map-get? course-completions {student: student, course-id: course-id})))
+            (match existing-completion
+                completion (map-set course-completions {student: student, course-id: course-id} (merge completion {
+                    final-grade: final-grade,
+                    attempts: (+ (get attempts completion) u1)
+                }))
+                (map-set course-completions {student: student, course-id: course-id} {
+                    completed: true,
+                    completion-date: stacks-block-height,
+                    final-grade: final-grade,
+                    attempts: u1
+                })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (create-certificate-template (course-id uint) (template-name (string-ascii 50)) (min-grade-required uint) (certificate-level (string-ascii 20)))
+    (let ((course (unwrap! (map-get? courses course-id) err-not-found)))
+        (asserts! (is-eq tx-sender (get creator course)) err-not-authorized)
+        (asserts! (and (>= min-grade-required u0) (<= min-grade-required u100)) err-invalid-grade)
+        (map-set certificate-templates course-id {
+            course-id: course-id,
+            template-name: template-name,
+            min-grade-required: min-grade-required,
+            certificate-level: certificate-level,
+            active: true
+        })
+        (ok true)
+    )
+)
+
+(define-public (issue-certificate (student principal) (course-id uint) (certificate-hash (string-ascii 64)))
+    (let ((course (unwrap! (map-get? courses course-id) err-not-found))
+          (completion (unwrap! (map-get? course-completions {student: student, course-id: course-id}) err-not-completed))
+          (template (unwrap! (map-get? certificate-templates course-id) err-not-found))
+          (certificate-id (var-get next-certificate-id)))
+        (asserts! (is-eq tx-sender (get creator course)) err-not-authorized)
+        (asserts! (get completed completion) err-not-completed)
+        (asserts! (>= (get final-grade completion) (get min-grade-required template)) err-invalid-grade)
+        (asserts! (get active template) err-not-authorized)
+        (asserts! (is-none (map-get? certificates (- (var-get next-certificate-id) u1))) err-already-certified)
+        (try! (nft-mint? skillhub-certificate certificate-id student))
+        (map-set certificates certificate-id {
+            student: student,
+            course-id: course-id,
+            instructor: tx-sender,
+            grade: (get final-grade completion),
+            completion-date: (get completion-date completion),
+            certificate-hash: certificate-hash,
+            certificate-level: (get certificate-level template),
+            active: true,
+            verification-code: (generate-verification-code student course-id)
+        })
+        (var-set next-certificate-id (+ certificate-id u1))
+        (ok certificate-id)
+    )
+)
+
+
+
+(define-public (verify-certificate (certificate-id uint) (verification-code (string-ascii 32)))
+    (let ((certificate (unwrap! (map-get? certificates certificate-id) err-certificate-not-found)))
+        (asserts! (get active certificate) err-certificate-revoked)
+        (asserts! (is-eq verification-code (get verification-code certificate)) err-not-authorized)
+        (map-set certificate-verifications {certificate-id: certificate-id, verifier: tx-sender} {
+            verified-at: stacks-block-height,
+            verification-status: true
+        })
+        (ok true)
+    )
+)
+
+(define-public (revoke-certificate (certificate-id uint))
+    (let ((certificate (unwrap! (map-get? certificates certificate-id) err-certificate-not-found))
+          (course (unwrap! (map-get? courses (get course-id certificate)) err-not-found)))
+        (asserts! (is-eq tx-sender (get creator course)) err-not-authorized)
+        (map-set certificates certificate-id (merge certificate {
+            active: false
+        }))
+        (ok true)
+    )
+)
+
+(define-public (transfer-certificate (certificate-id uint) (new-owner principal))
+    (let ((certificate (unwrap! (map-get? certificates certificate-id) err-certificate-not-found)))
+        (asserts! (is-eq tx-sender (get student certificate)) err-not-authorized)
+        (asserts! (get active certificate) err-certificate-revoked)
+        (try! (nft-transfer? skillhub-certificate certificate-id tx-sender new-owner))
+        (map-set certificates certificate-id (merge certificate {
+            student: new-owner,
+            verification-code: (generate-verification-code new-owner (get course-id certificate))
+        }))
+        (ok true)
+    )
+)
+
+(define-public (update-certificate-template (course-id uint) (min-grade-required uint) (active bool))
+    (let ((course (unwrap! (map-get? courses course-id) err-not-found))
+          (template (unwrap! (map-get? certificate-templates course-id) err-not-found)))
+        (asserts! (is-eq tx-sender (get creator course)) err-not-authorized)
+        (asserts! (and (>= min-grade-required u0) (<= min-grade-required u100)) err-invalid-grade)
+        (map-set certificate-templates course-id (merge template {
+            min-grade-required: min-grade-required,
+            active: active
+        }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-certificate (certificate-id uint))
+    (ok (map-get? certificates certificate-id))
+)
+
+(define-read-only (get-course-completion (student principal) (course-id uint))
+    (ok (map-get? course-completions {student: student, course-id: course-id}))
+)
+
+(define-read-only (get-certificate-template (course-id uint))
+    (ok (map-get? certificate-templates course-id))
+)
+
+(define-read-only (get-certificate-verification (certificate-id uint) (verifier principal))
+    (ok (map-get? certificate-verifications {certificate-id: certificate-id, verifier: verifier}))
+)
+
+(define-read-only (validate-certificate (certificate-id uint) (verification-code (string-ascii 32)))
+    (match (map-get? certificates certificate-id)
+        certificate (ok (and (get active certificate) (is-eq verification-code (get verification-code certificate))))
+        (ok false)
+    )
+)
+
+
+
+
+
